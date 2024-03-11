@@ -207,6 +207,7 @@ open class RTMPStream: IOStream {
             lockQueue.async {
                 switch self.readyState {
                 case .publish, .publishing:
+                    
                     if self.paused {
                         self.pausedStatus = .init(hasAudio: self.hasAudio, hasVideo: self.hasVideo)
                         self.hasAudio = false
@@ -234,6 +235,11 @@ open class RTMPStream: IOStream {
     var audioTimestamp: Double = 0.0
     var videoTimestamp: Double = 0.0
     private(set) lazy var muxer = {
+        if self.root != nil {
+            // this stream is attached to a parent muxer
+            // so provide a useless muxer
+            return RTMPMuxer(nil)
+        }
         return RTMPMuxer(self)
     }()
     private var messages: [RTMPCommandMessage] = []
@@ -246,6 +252,10 @@ open class RTMPStream: IOStream {
     private var howToPublish: RTMPStream.HowToPublish = .live
     private var dataTimeStamps: [String: Date] = .init()
     private weak var connection: RTMPConnection?
+
+    private var muxerIsReadyAudio : Bool = false
+    private var muxerIsReadyVideo : Bool = false
+    private var dg : DispatchGroup? = nil
 
     /// Creates a new stream.
     public init(connection: RTMPConnection) {
@@ -260,7 +270,52 @@ open class RTMPStream: IOStream {
         }
         mixer.muxer = muxer
     }
+    
+    // This makes a new stream that is connection less
+    // its purpose is to receive data from the muxer and forward it to those attached
+    public init(completion: @escaping () -> Void) {
+        self.connection = nil
+        super.init()
+        dg = DispatchGroup()
+        dg?.enter()
+        dg?.enter()
+        dg?.notify(queue: .main, execute: completion)
+        dispatcher = EventDispatcher(target: self)
+        addEventListener(.rtmpStatus, selector: #selector(on(status:)), observer: self)
 
+        mixer.muxer = muxer
+
+        // Testing this.
+        lockQueue.async {
+            print("LIVESTREAMER FORCE PUBLISHING THIS IS ROOT \(self)")
+            self.readyState = .publishing(muxer: self.muxer)
+        }
+    }
+    
+    private var root : RTMPStream? = nil
+    
+    /// Creates a new stream tied to the other stream content -> other stream is responsible for encoding
+    /// and this stream will transmit the same video content to another rtmp endpoint.
+    public init(connection: RTMPConnection, other: RTMPStream?) {
+        self.connection = connection
+        if let om = other?.muxer {
+            if other?.connection != nil {
+                // boom this is misused!
+                fatalError("parent stream is not connectionless")
+            }
+            self.root = other
+        }
+        super.init()
+        dispatcher = EventDispatcher(target: self)
+        connection.streams.append(self)
+        addEventListener(.rtmpStatus, selector: #selector(on(status:)), observer: self)
+        connection.addEventListener(.rtmpStatus, selector: #selector(on(status:)), observer: self)
+        if connection.connected == true {
+            connection.createStream(self)
+        }
+        mixer.muxer = muxer
+    }
+    
     deinit {
         mixer.stopRunning()
         removeEventListener(.rtmpStatus, selector: #selector(on(status:)), observer: self)
@@ -428,6 +483,7 @@ open class RTMPStream: IOStream {
 
     override public func readyStateDidChange(to readyState: IOStream.ReadyState) {
         guard let connection else {
+            super.readyStateDidChange(to: readyState)
             return
         }
         switch readyState {
@@ -469,6 +525,10 @@ open class RTMPStream: IOStream {
             let metadata = makeMetaData()
             send(handlerName: "@setDataFrame", arguments: "onMetaData", metadata)
             self.metadata = metadata
+
+            // now can send the
+            root?.muxer.addStream(stream: self)
+
         default:
             break
         }
@@ -483,6 +543,7 @@ open class RTMPStream: IOStream {
             return
         }
         guard let connection, ReadyState.open.rawValue < readyState.rawValue else {
+            readyState = .open
             return
         }
         readyState = .open
@@ -507,6 +568,11 @@ open class RTMPStream: IOStream {
 
     func outputAudio(_ buffer: Data, withTimestamp: Double) {
         guard let connection, readyState == .publishing(muxer: muxer) else {
+            if !muxerIsReadyAudio  {
+                // only once.
+                muxerIsReadyAudio = true
+                dg?.leave()
+            }
             return
         }
         let type: FLVTagType = .audio
@@ -522,6 +588,12 @@ open class RTMPStream: IOStream {
 
     func outputVideo(_ buffer: Data, withTimestamp: Double) {
         guard let connection, readyState == .publishing(muxer: muxer) else {
+            if !muxerIsReadyVideo  {
+                // only once.
+                muxerIsReadyVideo = true
+                dg?.leave()
+            }
+
             return
         }
         let type: FLVTagType = .video

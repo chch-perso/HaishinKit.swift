@@ -4,16 +4,37 @@ import AVFoundation
 final class RTMPMuxer {
     static let aac: UInt8 = FLVAudioCodec.aac.rawValue << 4 | FLVSoundRate.kHz44.rawValue << 2 | FLVSoundSize.snd16bit.rawValue << 1 | FLVSoundType.stereo.rawValue
 
+    // so the muxer keeps the 1st buffer so on add it can play these
+    var firstAudioBuffer : Data? = nil
+    var firstVideoBuffer : Data? = nil
+    
     var audioFormat: AVAudioFormat? {
         didSet {
+            if stream == nil {
+                print("LIVESTREAMER AUDIO FOR CHILD.DISCARD")
+                return
+            }
+            print("LIVESTREAMER \(stream) AUDIO FORMAT SET")
             switch stream?.readyState {
             case .publishing:
+                print("LIVESTREAMER \(stream) AUDIO FORMAT SET AND PUBLISHING")
                 guard let audioFormat else {
+                    print("LIVESTREAMER \(stream) AUDIO FORMAT IS NIL")
                     return
                 }
+                print("LIVESTREAMER \(stream) AUDIO FORMAT SET AND PUBLISHING AAC")
+
                 var buffer = Data([RTMPMuxer.aac, FLVAACPacketType.seq.rawValue])
                 buffer.append(contentsOf: AudioSpecificConfig(formatDescription: audioFormat.formatDescription).bytes)
                 stream?.outputAudio(buffer, withTimestamp: 0)
+                slock.lock()
+                firstAudioBuffer = buffer
+                let others = additionalStreams
+                slock.unlock()
+                print("LIVESTREAMER others aac \(others.count)")
+                for ast in others {
+                    ast.outputAudio(buffer, withTimestamp: 0)
+                }
             case .playing:
                 if let audioFormat {
                     audioBuffer = AVAudioCompressedBuffer(format: audioFormat, packetCapacity: 1, maximumPacketSize: 1024 * Int(audioFormat.channelCount))
@@ -21,6 +42,7 @@ final class RTMPMuxer {
                     audioBuffer = nil
                 }
             default:
+                print("LIVESTREAMER \(stream) AUDIO FORMAT SET AND NOT PUBLISHING")
                 break
             }
         }
@@ -28,9 +50,17 @@ final class RTMPMuxer {
 
     var videoFormat: CMFormatDescription? {
         didSet {
+            if stream == nil {
+                print("LIVESTREAMER AUDIO FOR CHILD.DISCARD")
+                return
+            }
+
+            print("LIVESTREAMER \(stream) VIDEO FORMAT SET")
             switch stream?.readyState {
             case .publishing:
+                print("LIVESTREAMER \(stream) VIDEO FORMAT SET AND PUBLISHING")
                 guard let videoFormat else {
+                    print("LIVESTREAMER \(stream) VIDEO FORMAT IS NIL")
                     return
                 }
                 switch CMFormatDescriptionGetMediaSubType(videoFormat) {
@@ -38,22 +68,46 @@ final class RTMPMuxer {
                     guard let avcC = AVCDecoderConfigurationRecord.getData(videoFormat) else {
                         return
                     }
+                    print("LIVESTREAMER \(stream) VIDEO FORMAT SET AND PUBLISHING H264")
+
                     var buffer = Data([FLVFrameType.key.rawValue << 4 | FLVVideoCodec.avc.rawValue, FLVAVCPacketType.seq.rawValue, 0, 0, 0])
                     buffer.append(avcC)
                     stream?.outputVideo(buffer, withTimestamp: 0)
+                    slock.lock()
+                    firstVideoBuffer = buffer
+                    let others = additionalStreams
+                    slock.unlock()
+                    print("LIVESTREAMER others h264 \(others.count)")
+                    for ast in others {
+                        ast.outputVideo(buffer, withTimestamp: 0)
+                    }
+
+
                 case kCMVideoCodecType_HEVC:
                     guard let hvcC = HEVCDecoderConfigurationRecord.getData(videoFormat) else {
                         return
                     }
+                    print("LIVESTREAMER \(stream) VIDEO FORMAT SET AND PUBLISHING HEVC")
+
                     var buffer = Data([0b10000000 | FLVFrameType.key.rawValue << 4 | FLVVideoPacketType.sequenceStart.rawValue, 0x68, 0x76, 0x63, 0x31])
                     buffer.append(hvcC)
                     stream?.outputVideo(buffer, withTimestamp: 0)
+                    slock.lock()
+                    firstVideoBuffer = buffer
+                    let others = additionalStreams
+                    slock.unlock()
+                    print("LIVESTREAMER others hevc \(others.count)")
+                    for ast in others {
+                        ast.outputVideo(buffer, withTimestamp: 0)
+                    }
+
                 default:
                     break
                 }
             case .playing:
                 stream?.dispatch(.rtmpStatus, bubbles: false, data: RTMPStream.Code.videoDimensionChange.data(""))
             default:
+                print("LIVESTREAMER \(stream) VIDEO FORMAT SET AND NOT PUBLISHING")
                 break
             }
         }
@@ -66,8 +120,31 @@ final class RTMPMuxer {
     private let compositiionTimeOffset: CMTime = .init(value: 3, timescale: 30)
     private weak var stream: RTMPStream?
 
-    init(_ stream: RTMPStream) {
+    let slock = NSLock()
+    private var additionalStreams: [RTMPStream] = []
+
+    init(_ stream: RTMPStream?) {
         self.stream = stream
+    }
+
+    func addStream(stream: RTMPStream) {
+        slock.lock()
+        additionalStreams.append(stream)
+        slock.unlock()
+        // so WHEN should we add first audio/video buffers to the added stream?
+        // when they are publishing.
+        // should these be added ONCE they are publishing then?
+        // makes sense!
+        if let audio = firstAudioBuffer {
+            print("LIVESTREAMER \(self.stream) CATCHUP AUDIO \(stream)")
+            stream.outputAudio(audio, withTimestamp: 0)
+        }
+        if let video = firstVideoBuffer {
+            print("LIVESTREAMER \(self.stream) CATCHUP VIDEO \(stream)")
+            stream.outputVideo(video, withTimestamp: 0)
+        } else {
+            print("LIVESTREAMER \(self.stream) CAN'T CATCHUP VIDEO YET \(stream)")
+        }
     }
 
     func append(_ message: RTMPAudioMessage, type: RTMPChunkType) {
@@ -164,6 +241,12 @@ extension RTMPMuxer: IOMuxer {
         var buffer = Data([RTMPMuxer.aac, FLVAACPacketType.raw.rawValue])
         buffer.append(audioBuffer.data.assumingMemoryBound(to: UInt8.self), count: Int(audioBuffer.byteLength))
         stream?.outputAudio(buffer, withTimestamp: delta)
+        slock.lock()
+        let others = additionalStreams
+        slock.unlock()
+        for ast in others {
+            ast.outputAudio(buffer, withTimestamp: delta)
+        }
         audioTimeStamp = when
     }
 
@@ -181,11 +264,23 @@ extension RTMPMuxer: IOMuxer {
             buffer.append(contentsOf: compositionTime.bigEndian.data[1..<4])
             buffer.append(data)
             stream?.outputVideo(buffer, withTimestamp: delta)
+            slock.lock()
+            let others = additionalStreams
+            slock.unlock()
+            for ast in others {
+                ast.outputVideo(buffer, withTimestamp: delta)
+            }
         case kCMVideoCodecType_HEVC:
             var buffer = Data([0b10000000 | ((keyframe ? FLVFrameType.key.rawValue : FLVFrameType.inter.rawValue) << 4) | FLVVideoPacketType.codedFrames.rawValue, 0x68, 0x76, 0x63, 0x31])
             buffer.append(contentsOf: compositionTime.bigEndian.data[1..<4])
             buffer.append(data)
             stream?.outputVideo(buffer, withTimestamp: delta)
+            slock.lock()
+            let others = additionalStreams
+            slock.unlock()
+            for ast in others {
+                ast.outputVideo(buffer, withTimestamp: delta)
+            }
         default:
             break
         }
